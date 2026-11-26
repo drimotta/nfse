@@ -1,3 +1,4 @@
+pub mod capi;
 pub mod cli;
 pub mod connector;
 pub mod dps;

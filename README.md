@@ -193,6 +193,16 @@ prefixes; set `SOFTHSM_MODULE` to use another path.
 
 Test fixtures are synthetic. Do not add real NFS-e XMLs to the repository.
 
+`make c-test` builds the shared library and runs a C program against
+`include/nfse.h`.
+
+## C API
+
+The library also builds as `libnfse.so`/`.dylib`/`.a` with a C API for
+programs that build, sign or submit separately (a server builds the DPS, an
+agent on the user's machine signs and submits it). See
+[docs/c-api.md](docs/c-api.md).
+
 ## Troubleshooting TLS
 
 ```bash

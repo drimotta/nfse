@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y softhsm2 opensc xmlsec1 libxml2-utils libssl-dev pkg-config
+      - name: Tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install softhsm opensc libxmlsec1 openssl@3
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          echo "SOFTHSM_MODULE=$(brew --prefix softhsm)/lib/softhsm/libsofthsm2.so" >> "$GITHUB_ENV"
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: make c-test

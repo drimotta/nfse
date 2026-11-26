@@ -9,8 +9,9 @@ use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
 use cryptoki::slot::Slot;
 use cryptoki::types::AuthPin;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// Where to find the PKCS#11 module when `NFSE_PKCS11_MODULE` is not set, in
 /// order. Homebrew on Apple Silicon and Intel, the OpenSC installer; Debian
@@ -82,7 +83,7 @@ pub struct Token {
     /// before every signature.
     always_auth: Option<(AuthPin, libloading::Library)>,
     // Keep the context alive (and finalized last).
-    _ctx: Pkcs11,
+    _ctx: Module,
 }
 
 impl std::fmt::Debug for Token {
@@ -101,10 +102,7 @@ impl Token {
         selection: &Selection,
         pin: impl FnOnce() -> Result<String>,
     ) -> Result<Token> {
-        let ctx = Pkcs11::new(module)
-            .with_context(|| format!("cannot load PKCS#11 module {}", module.display()))?;
-        ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-            .context("C_Initialize failed")?;
+        let ctx = Module::open(module)?;
         let slot = pick_slot(&ctx, selection)?;
         let session = ctx
             .open_ro_session(slot)
@@ -231,7 +229,7 @@ impl CertInfo {
     }
 
     /// Can sign the DPS and authenticate the TLS client.
-    fn usable(&self) -> bool {
+    pub fn usable(&self) -> bool {
         !self.is_ca && self.valid_now && self.digital_signature && self.client_auth != Some(false)
     }
 }
@@ -418,5 +416,137 @@ mod tests {
             err.contains("/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so"),
             "{err}"
         );
+    }
+}
+
+/// A certificate on a token, read without logging in.
+#[derive(Debug, Clone)]
+pub struct ListedCertificate {
+    pub id: Vec<u8>,
+    pub label: String,
+    pub der: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListedToken {
+    pub label: String,
+    pub serial: String,
+    pub certificates: Vec<ListedCertificate>,
+}
+
+/// The tokens of a module and the certificates each shows before login.
+pub fn list_certificates(module: &Path) -> Result<Vec<ListedToken>> {
+    let ctx = Module::open(module)?;
+    let mut tokens = Vec::new();
+    for slot in ctx
+        .get_slots_with_token()
+        .context("cannot list PKCS#11 slots")?
+    {
+        let info = ctx.get_token_info(slot)?;
+        let Ok(session) = ctx.open_ro_session(slot) else {
+            continue;
+        };
+        let mut certificates = Vec::new();
+        for cert in session.find_objects(&[Attribute::Class(ObjectClass::CERTIFICATE)])? {
+            let mut c = ListedCertificate {
+                id: Vec::new(),
+                label: String::new(),
+                der: Vec::new(),
+            };
+            for attr in session.get_attributes(
+                cert,
+                &[
+                    AttributeType::Id,
+                    AttributeType::Label,
+                    AttributeType::Value,
+                ],
+            )? {
+                match attr {
+                    Attribute::Id(v) => c.id = v,
+                    Attribute::Label(v) => c.label = String::from_utf8_lossy(&v).into_owned(),
+                    Attribute::Value(v) => c.der = v,
+                    _ => {}
+                }
+            }
+            if !c.der.is_empty() {
+                certificates.push(c);
+            }
+        }
+        tokens.push(ListedToken {
+            label: info.label().trim().to_string(),
+            serial: info.serial_number().trim().to_string(),
+            certificates,
+        });
+    }
+    Ok(tokens)
+}
+
+/// An initialized module. A module is loaded once per process and never
+/// unloaded (unloading SoftHSM on macOS and loading it again crashes); it is
+/// initialized while at least one `Module` is alive and finalized when the
+/// last one goes, so the next use starts from a fresh C_Initialize.
+/// Sessions must be dropped first: declare them after the module.
+struct Module {
+    ctx: Pkcs11,
+    key: PathBuf,
+}
+
+struct Loaded {
+    ctx: Pkcs11,
+    users: usize,
+}
+
+fn loaded() -> &'static Mutex<HashMap<PathBuf, Loaded>> {
+    static LOADED: OnceLock<Mutex<HashMap<PathBuf, Loaded>>> = OnceLock::new();
+    LOADED.get_or_init(Default::default)
+}
+
+impl Module {
+    fn open(module: &Path) -> Result<Module> {
+        let key = module
+            .canonicalize()
+            .unwrap_or_else(|_| module.to_path_buf());
+        let mut all = loaded()
+            .lock()
+            .map_err(|_| anyhow!("PKCS#11 module registry poisoned"))?;
+        if !all.contains_key(&key) {
+            let ctx = Pkcs11::new(module)
+                .with_context(|| format!("cannot load PKCS#11 module {}", module.display()))?;
+            all.insert(key.clone(), Loaded { ctx, users: 0 });
+        }
+        let entry = all.get_mut(&key).expect("just inserted");
+        if entry.users == 0 {
+            entry
+                .ctx
+                .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+                .context("C_Initialize failed")?;
+        }
+        entry.users += 1;
+        Ok(Module {
+            ctx: entry.ctx.clone(),
+            key,
+        })
+    }
+}
+
+impl std::ops::Deref for Module {
+    type Target = Pkcs11;
+    fn deref(&self) -> &Pkcs11 {
+        &self.ctx
+    }
+}
+
+impl Drop for Module {
+    fn drop(&mut self) {
+        let Ok(mut all) = loaded().lock() else { return };
+        let Some(entry) = all.get_mut(&self.key) else {
+            return;
+        };
+        entry.users -= 1;
+        if entry.users == 0
+            && let Err(e) = entry.ctx.clone().finalize()
+        {
+            log::warn!(target: "nfse::pkcs11", "C_Finalize failed: {e}");
+        }
     }
 }
