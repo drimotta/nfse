@@ -231,7 +231,7 @@ impl CertInfo {
     }
 
     /// Can sign the DPS and authenticate the TLS client.
-    fn usable(&self) -> bool {
+    pub fn usable(&self) -> bool {
         !self.is_ca && self.valid_now && self.digital_signature && self.client_auth != Some(false)
     }
 }
@@ -419,4 +419,69 @@ mod tests {
             "{err}"
         );
     }
+}
+
+/// A certificate on a token, read without logging in.
+#[derive(Debug, Clone)]
+pub struct ListedCertificate {
+    pub id: Vec<u8>,
+    pub label: String,
+    pub der: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListedToken {
+    pub label: String,
+    pub serial: String,
+    pub certificates: Vec<ListedCertificate>,
+}
+
+/// The tokens of a module and the certificates each shows before login.
+pub fn list_certificates(module: &Path) -> Result<Vec<ListedToken>> {
+    let ctx = Pkcs11::new(module)
+        .with_context(|| format!("cannot load PKCS#11 module {}", module.display()))?;
+    ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+        .context("C_Initialize failed")?;
+    let mut tokens = Vec::new();
+    for slot in ctx
+        .get_slots_with_token()
+        .context("cannot list PKCS#11 slots")?
+    {
+        let info = ctx.get_token_info(slot)?;
+        let Ok(session) = ctx.open_ro_session(slot) else {
+            continue;
+        };
+        let mut certificates = Vec::new();
+        for cert in session.find_objects(&[Attribute::Class(ObjectClass::CERTIFICATE)])? {
+            let mut c = ListedCertificate {
+                id: Vec::new(),
+                label: String::new(),
+                der: Vec::new(),
+            };
+            for attr in session.get_attributes(
+                cert,
+                &[
+                    AttributeType::Id,
+                    AttributeType::Label,
+                    AttributeType::Value,
+                ],
+            )? {
+                match attr {
+                    Attribute::Id(v) => c.id = v,
+                    Attribute::Label(v) => c.label = String::from_utf8_lossy(&v).into_owned(),
+                    Attribute::Value(v) => c.der = v,
+                    _ => {}
+                }
+            }
+            if !c.der.is_empty() {
+                certificates.push(c);
+            }
+        }
+        tokens.push(ListedToken {
+            label: info.label().trim().to_string(),
+            serial: info.serial_number().trim().to_string(),
+            certificates,
+        });
+    }
+    Ok(tokens)
 }
