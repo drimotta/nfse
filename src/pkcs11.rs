@@ -82,7 +82,7 @@ pub struct Token {
     /// before every signature.
     always_auth: Option<(AuthPin, libloading::Library)>,
     // Keep the context alive (and finalized last).
-    _ctx: Pkcs11,
+    _ctx: Module,
 }
 
 impl std::fmt::Debug for Token {
@@ -101,10 +101,7 @@ impl Token {
         selection: &Selection,
         pin: impl FnOnce() -> Result<String>,
     ) -> Result<Token> {
-        let ctx = Pkcs11::new(module)
-            .with_context(|| format!("cannot load PKCS#11 module {}", module.display()))?;
-        ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-            .context("C_Initialize failed")?;
+        let ctx = Module::open(module)?;
         let slot = pick_slot(&ctx, selection)?;
         let session = ctx
             .open_ro_session(slot)
@@ -438,10 +435,7 @@ pub struct ListedToken {
 
 /// The tokens of a module and the certificates each shows before login.
 pub fn list_certificates(module: &Path) -> Result<Vec<ListedToken>> {
-    let ctx = Pkcs11::new(module)
-        .with_context(|| format!("cannot load PKCS#11 module {}", module.display()))?;
-    ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-        .context("C_Initialize failed")?;
+    let ctx = Module::open(module)?;
     let mut tokens = Vec::new();
     for slot in ctx
         .get_slots_with_token()
@@ -484,4 +478,36 @@ pub fn list_certificates(module: &Path) -> Result<Vec<ListedToken>> {
         });
     }
     Ok(tokens)
+}
+
+/// An initialized module, finalized when dropped, so a library caller can
+/// open it again (cryptoki does not finalize on drop). Sessions must be
+/// dropped first: declare them after the context.
+struct Module(Option<Pkcs11>);
+
+impl Module {
+    fn open(module: &Path) -> Result<Module> {
+        let ctx = Pkcs11::new(module)
+            .with_context(|| format!("cannot load PKCS#11 module {}", module.display()))?;
+        ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+            .context("C_Initialize failed")?;
+        Ok(Module(Some(ctx)))
+    }
+}
+
+impl std::ops::Deref for Module {
+    type Target = Pkcs11;
+    fn deref(&self) -> &Pkcs11 {
+        self.0.as_ref().expect("open until dropped")
+    }
+}
+
+impl Drop for Module {
+    fn drop(&mut self) {
+        if let Some(ctx) = self.0.take()
+            && let Err(e) = ctx.finalize()
+        {
+            log::warn!(target: "nfse::pkcs11", "C_Finalize failed: {e}");
+        }
+    }
 }

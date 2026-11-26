@@ -230,6 +230,23 @@ fn a_wrong_pin_is_reported_as_such() {
     assert_eq!(code, NFSE_ERR_PIN, "{resp}");
     assert_eq!(resp["error"]["code"], "pin");
     assert!(s.is_null());
+    // A failed login leaves the module usable for the next attempt.
+    let (code, s, resp) = open(&session_request());
+    assert_eq!(code, NFSE_OK, "{resp}");
+    unsafe { nfse_session_close(s) };
+}
+
+#[test]
+fn listing_and_sessions_can_follow_each_other() {
+    let Some(_g) = ready() else { return };
+    let _t = TestToken::new(false);
+    for _ in 0..2 {
+        let (code, resp) = call(nfse_list_certificates, &json!({"module": softhsm_module()}));
+        assert_eq!(code, NFSE_OK, "{resp}");
+        let (code, s, resp) = open(&session_request());
+        assert_eq!(code, NFSE_OK, "{resp}");
+        unsafe { nfse_session_close(s) };
+    }
 }
 
 #[test]
