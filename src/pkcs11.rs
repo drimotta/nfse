@@ -9,8 +9,9 @@ use cryptoki::object::{Attribute, AttributeType, ObjectClass, ObjectHandle};
 use cryptoki::session::{Session, UserType};
 use cryptoki::slot::Slot;
 use cryptoki::types::AuthPin;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// Where to find the PKCS#11 module when `NFSE_PKCS11_MODULE` is not set, in
 /// order. Homebrew on Apple Silicon and Intel, the OpenSC installer; Debian
@@ -480,32 +481,70 @@ pub fn list_certificates(module: &Path) -> Result<Vec<ListedToken>> {
     Ok(tokens)
 }
 
-/// An initialized module, finalized when dropped, so a library caller can
-/// open it again (cryptoki does not finalize on drop). Sessions must be
-/// dropped first: declare them after the context.
-struct Module(Option<Pkcs11>);
+/// An initialized module. A module is loaded once per process and never
+/// unloaded (unloading SoftHSM on macOS and loading it again crashes); it is
+/// initialized while at least one `Module` is alive and finalized when the
+/// last one goes, so the next use starts from a fresh C_Initialize.
+/// Sessions must be dropped first: declare them after the module.
+struct Module {
+    ctx: Pkcs11,
+    key: PathBuf,
+}
+
+struct Loaded {
+    ctx: Pkcs11,
+    users: usize,
+}
+
+fn loaded() -> &'static Mutex<HashMap<PathBuf, Loaded>> {
+    static LOADED: OnceLock<Mutex<HashMap<PathBuf, Loaded>>> = OnceLock::new();
+    LOADED.get_or_init(Default::default)
+}
 
 impl Module {
     fn open(module: &Path) -> Result<Module> {
-        let ctx = Pkcs11::new(module)
-            .with_context(|| format!("cannot load PKCS#11 module {}", module.display()))?;
-        ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
-            .context("C_Initialize failed")?;
-        Ok(Module(Some(ctx)))
+        let key = module
+            .canonicalize()
+            .unwrap_or_else(|_| module.to_path_buf());
+        let mut all = loaded()
+            .lock()
+            .map_err(|_| anyhow!("PKCS#11 module registry poisoned"))?;
+        if !all.contains_key(&key) {
+            let ctx = Pkcs11::new(module)
+                .with_context(|| format!("cannot load PKCS#11 module {}", module.display()))?;
+            all.insert(key.clone(), Loaded { ctx, users: 0 });
+        }
+        let entry = all.get_mut(&key).expect("just inserted");
+        if entry.users == 0 {
+            entry
+                .ctx
+                .initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))
+                .context("C_Initialize failed")?;
+        }
+        entry.users += 1;
+        Ok(Module {
+            ctx: entry.ctx.clone(),
+            key,
+        })
     }
 }
 
 impl std::ops::Deref for Module {
     type Target = Pkcs11;
     fn deref(&self) -> &Pkcs11 {
-        self.0.as_ref().expect("open until dropped")
+        &self.ctx
     }
 }
 
 impl Drop for Module {
     fn drop(&mut self) {
-        if let Some(ctx) = self.0.take()
-            && let Err(e) = ctx.finalize()
+        let Ok(mut all) = loaded().lock() else { return };
+        let Some(entry) = all.get_mut(&self.key) else {
+            return;
+        };
+        entry.users -= 1;
+        if entry.users == 0
+            && let Err(e) = entry.ctx.clone().finalize()
         {
             log::warn!(target: "nfse::pkcs11", "C_Finalize failed: {e}");
         }
