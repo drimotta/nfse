@@ -112,35 +112,90 @@ impl Dps {
     }
 }
 
-/// Builds the DPS from validated content, adding the generated fields.
+/// Builds the DPS from validated content, adding the generated fields. The
+/// series and number come from the timestamp.
 pub fn build_dps(
     content: &Map<String, Value>,
     env: Environment,
     now: DateTime<FixedOffset>,
 ) -> Result<Dps> {
-    let now = now.with_timezone(&brt());
     let (serie, n_dps) = dps_numbers(&now);
+    build_dps_numbered(content, env, now, &serie, &n_dps)
+}
+
+/// Builds the DPS with the given series and number, which the caller keeps
+/// unique (a DPS id is never used twice).
+pub fn build_dps_numbered(
+    content: &Map<String, Value>,
+    env: Environment,
+    now: DateTime<FixedOffset>,
+    serie: &str,
+    n_dps: &str,
+) -> Result<Dps> {
+    let now = now.with_timezone(&brt());
     let mut full = content.clone();
     let generated = [
         env.tp_amb().to_string(),
         now.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
         APP_VERSION.to_string(),
-        serie.clone(),
-        n_dps.clone(),
+        serie.to_string(),
+        n_dps.to_string(),
     ];
     for (field, value) in GENERATED.iter().zip(generated) {
         full.insert(field.to_string(), Value::String(value));
     }
+    assemble(&full, env)
+}
+
+/// Validates the full `infDPS` content and writes it.
+fn assemble(full: &Map<String, Value>, env: Environment) -> Result<Dps> {
     let schema = schema::inf_dps(env);
-    let errors = schema::validate(&full, schema, "");
+    let errors = schema::validate(full, schema, "");
     if !errors.is_empty() {
         bail!("invalid DPS:\n  - {}", errors.join("\n  - "));
     }
-    let id = dps_id(&full, &serie, &n_dps)?;
+    let text = |f: &str| full.get(f).and_then(Value::as_str).unwrap_or_default();
+    let (serie, n_dps) = (text("serie"), text("nDPS"));
+    let digits =
+        |s: &str, max: usize| (1..=max).contains(&s.len()) && s.chars().all(|c| c.is_ascii_digit());
+    if !digits(serie, 5) {
+        bail!("invalid DPS:\n  - serie: 1 to 5 digits, got {serie:?}");
+    }
+    if !digits(n_dps, 15) || n_dps.starts_with('0') {
+        bail!("invalid DPS:\n  - nDPS: 1 to 15 digits without leading zeros, got {n_dps:?}");
+    }
+    let id = dps_id(full, serie, n_dps)?;
     let mut inf_dps = format!(r#"<infDPS Id="{id}">"#);
-    schema::write_children(&mut inf_dps, &full, schema).map_err(|e| anyhow!(e))?;
+    schema::write_children(&mut inf_dps, full, schema).map_err(|e| anyhow!(e))?;
     inf_dps.push_str("</infDPS>");
     Ok(Dps { id, inf_dps })
+}
+
+impl Dps {
+    /// Reads back an unsigned DPS written by [`Dps::xml`]. Anything else is
+    /// refused, including the same content written differently, so what is
+    /// signed is exactly what was built and checked.
+    pub fn from_unsigned_xml(xml: &str) -> Result<Dps> {
+        let head = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><DPS xmlns="{NS}" versao="{VERSION}">"#
+        );
+        let inf_dps = xml
+            .strip_prefix(&head)
+            .and_then(|rest| rest.strip_suffix("</DPS>"))
+            .filter(|inf| inf.starts_with("<infDPS Id=\"") && inf.ends_with("</infDPS>"))
+            .ok_or_else(|| anyhow!("not an unsigned DPS"))?;
+        let full = crate::input::infdps_from_xml(xml)?;
+        let env = match full.get("tpAmb").and_then(Value::as_str) {
+            Some("1") => Environment::Production,
+            Some("2") => Environment::Staging,
+            other => bail!("bad tpAmb {other:?}"),
+        };
+        let dps = assemble(&full, env)?;
+        if dps.inf_dps != inf_dps {
+            bail!("the DPS is not in the form this library writes");
+        }
+        Ok(dps)
+    }
 }
 
 /// An RSA key that signs a PKCS#1 v1.5 `DigestInfo` (`CKM_RSA_PKCS`).
@@ -325,6 +380,92 @@ mod tests {
             dps.inf_dps
         );
         assert!(dps.xml().starts_with(r#"<?xml version="1.0" encoding="UTF-8"?><DPS xmlns="http://www.sped.fazenda.gov.br/nfse" versao="1.01"><infDPS Id="DPS"#));
+    }
+
+    #[test]
+    fn explicit_numbers_are_used_instead_of_the_timestamp() {
+        let content = combine(
+            Some(infdps_from_xml(NOV).unwrap()),
+            &Map::new(),
+            Environment::Staging,
+        )
+        .unwrap();
+        let now = at(2026, 11, 26, 10, 5, 9);
+        let dps = build_dps_numbered(&content, Environment::Staging, now, "1", "42").unwrap();
+        assert_eq!(dps.id, "DPS310620021234567800019500001000000000000042");
+        assert!(
+            dps.inf_dps.contains("<serie>1</serie><nDPS>42</nDPS>"),
+            "{}",
+            dps.inf_dps
+        );
+        assert!(
+            dps.inf_dps
+                .contains("<dhEmi>2026-11-26T10:05:09-03:00</dhEmi>")
+        );
+    }
+
+    #[test]
+    fn explicit_numbers_must_fit_the_schema() {
+        let content = combine(
+            Some(infdps_from_xml(NOV).unwrap()),
+            &Map::new(),
+            Environment::Staging,
+        )
+        .unwrap();
+        let now = at(2026, 11, 26, 10, 5, 9);
+        for (serie, n) in [
+            ("1", "042"),
+            ("1", ""),
+            ("", "1"),
+            ("1", "1234567890123456"),
+            ("x", "1"),
+        ] {
+            assert!(
+                build_dps_numbered(&content, Environment::Staging, now, serie, n).is_err(),
+                "serie {serie:?} nDPS {n:?} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsigned_dps_reads_back_from_its_xml() {
+        let content = combine(
+            Some(infdps_from_xml(NOV).unwrap()),
+            &Map::new(),
+            Environment::Staging,
+        )
+        .unwrap();
+        let dps = build_dps(&content, Environment::Staging, at(2026, 11, 26, 10, 5, 9)).unwrap();
+        let back = Dps::from_unsigned_xml(&dps.xml()).unwrap();
+        assert_eq!(back.id, dps.id);
+        assert_eq!(back.inf_dps, dps.inf_dps);
+    }
+
+    #[test]
+    fn only_an_unsigned_dps_in_canonical_form_reads_back() {
+        let content = combine(
+            Some(infdps_from_xml(NOV).unwrap()),
+            &Map::new(),
+            Environment::Staging,
+        )
+        .unwrap();
+        let dps = build_dps(&content, Environment::Staging, at(2026, 11, 26, 10, 5, 9)).unwrap();
+        let xml = dps.xml();
+        let signer = FakeSigner(vec![Default::default()]);
+        let bad = [
+            sign_dps(&dps, &signer).unwrap(),
+            xml.replace("<infDPS ", "<infDPS  "),
+            xml.replace("</DPS>", "</DPS> "),
+            xml.replace("</infDPS>", "</infDPS><x></x>"),
+            xml.replace(NS, "urn:other"),
+            xml.replace("versao=\"1.01\"", "versao=\"9\""),
+            xml.replace(&format!("Id=\"{}\"", dps.id), "Id=\"DPS1\""),
+            xml.replace("<tpAmb>", "<!-- x --><tpAmb>"),
+            "<DPS/>".to_string(),
+        ];
+        for xml in bad {
+            assert!(Dps::from_unsigned_xml(&xml).is_err(), "accepted {xml}");
+        }
     }
 
     struct FakeSigner(Vec<std::cell::RefCell<Vec<u8>>>);
